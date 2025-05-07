@@ -1,6 +1,6 @@
 CUTLASS_DIR=${PWD}/../external/cutlass
 CXX=nvcc
-APP=copy
+APP=transpose
 
 # CXXFLAGS=-DNDEBUG --generate-code=arch=compute_90a,code=[compute_90a] -std=c++17 -O3 -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing -I${CUTLASS_DIR}/include -I${CUTLASS_DIR}/examples/common -I${CUTLASS_DIR}/tools/util/include --expt-relaxed-constexpr
 

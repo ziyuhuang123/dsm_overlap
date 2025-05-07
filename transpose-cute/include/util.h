@@ -1,5 +1,7 @@
 #pragma once
 
+#include <iomanip>
+
 template <typename T> struct TransposeParams {
   T *__restrict__ input;
   T *__restrict__ output;
@@ -11,7 +13,7 @@ template <typename T> struct TransposeParams {
       : input(input_), output(output_), M(M_), N(N_) {}
 };
 
-//template <typename T> int benchmark(void (*transpose)(int M, int N, T* input, T* output), int M, int N, int iterations=10, bool verify=true) {
+// template <typename T> int benchmark(void (*transpose)(int M, int N, T* input, T* output), int M, int N, int iterations=10, bool verify=true) {
 template <typename T, bool isTranspose = true, bool isFMA = false> int benchmark(void (*transpose)(TransposeParams<T> params), int M, int N, int iterations=10, bool verify=true) {
   using namespace cute;
 
@@ -45,9 +47,12 @@ template <typename T, bool isTranspose = true, bool isFMA = false> int benchmark
     double time_ms = tDiff.count();
     int numThreads = 256;
     // int numThreads = 128;
-    size_t bytes = !isFMA ? 2 * M * N * sizeof(T) : (M * N + M * numThreads) * sizeof(T);
+    double M_ = double(M);
+    double N_ = double(N);
+    double bytes = !isFMA ? 2 * M_ * N_ * sizeof(T) : (M_ * N_ + M_ * numThreads) * sizeof(T);
     
     std::cout << "Trial " << i << " Completed in " << time_ms << "ms ("
+              << std::fixed << std::setprecision(2) 
               << 1e-6 * bytes / time_ms << " GB/s)"
               << std::endl;
 
@@ -55,7 +60,9 @@ template <typename T, bool isTranspose = true, bool isFMA = false> int benchmark
       uint64_t flops = numThreads * 2 * uint64_t(M) * uint64_t(N);
       double AI = double(flops) / double(bytes);
       std::cout << "Arithmetic Intensity = " << AI << std::endl;
-      std::cout << "TFLOPs/s = " << 1e-9 * flops / time_ms << std::endl;
+      std::cout << "TFLOPs/s = "
+                << std::fixed << std::setprecision(2) 
+                << (1e-9 * flops / time_ms) << std::endl;
 
     }
   }
