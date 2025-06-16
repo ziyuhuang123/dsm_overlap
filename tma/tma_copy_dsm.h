@@ -20,38 +20,92 @@
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/helper_cuda.hpp"
 #include "cutlass/util/print_error.hpp"
-
+#include <cute/arch/util.hpp>
 #include "cutlass/detail/layout.hpp"
 
 #include "cuda_launch.hpp"
 #include "shared_storage.h"
 #include "smem_helper.hpp"
 
-template <typename _TiledCopyS, typename _TiledCopyD, typename _GmemLayout,
-          typename _SmemLayout, typename _TileShape>
-struct Params {
-  using TiledCopyS = _TiledCopyS;
-  using TiledCopyD = _TiledCopyD;
-  using GmemLayout = _GmemLayout;
-  using SmemLayout = _SmemLayout;
-  using TileShape = _TileShape;
+// template <typename _TiledCopyS, typename _TiledCopyD, typename _GmemLayout,
+//           typename _SmemLayout, typename _TileShape>
+// struct Params {
+//   using TiledCopyS = _TiledCopyS;
+//   using TiledCopyD = _TiledCopyD;
+//   using GmemLayout = _GmemLayout;
+//   using SmemLayout = _SmemLayout;
+//   using TileShape = _TileShape;
 
-  TiledCopyS const tmaLoad;
-  TiledCopyD const tmaStore;
-  GmemLayout const gmemLayout;
-  SmemLayout const smemLayout;
-  TileShape const tileShape;
+//   TiledCopyS const tmaLoad;
+//   TiledCopyD const tmaStore;
+//   GmemLayout const gmemLayout;
+//   SmemLayout const smemLayout;
+//   TileShape const tileShape;
 
-  Params(_TiledCopyS const &tmaLoad, _TiledCopyD const &tmaStore,
-         _GmemLayout const &gmemLayout, _SmemLayout const &smemLayout,
-         _TileShape const &tileShape)
-      : tmaLoad(tmaLoad), tmaStore(tmaStore), gmemLayout(gmemLayout),
-        smemLayout(smemLayout), tileShape(tileShape) {}
-};
+//   Params(_TiledCopyS const &tmaLoad, _TiledCopyD const &tmaStore,
+//          _GmemLayout const &gmemLayout, _SmemLayout const &smemLayout,
+//          _TileShape const &tileShape)
+//       : tmaLoad(tmaLoad), tmaStore(tmaStore), gmemLayout(gmemLayout),
+//         smemLayout(smemLayout), tileShape(tileShape) {}
+// };
+
+
+template <typename BarrierT, typename SourceT, typename DstT>
+CUTLASS_DEVICE void copy_dsm(BarrierT& barrier,
+                            SourceT source,
+                            DstT dst,
+                            uint32_t size,
+                            uint32_t dst_block_rank) {
+
+  using namespace cute;                      
+
+  uint32_t bar_ptr;
+  if constexpr (std::is_integral_v<BarrierT>) {
+    bar_ptr = barrier;
+  }
+  else {
+    // bar_ptr = cast_smem_ptr_to_uint(cute::raw_pointer_cast(barrier.data()));
+    bar_ptr = cast_smem_ptr_to_uint(&barrier); // 这里和之前写法还稍有不同。包括函数定义的时候对barrier也要加上&
+  }
+
+  uint32_t src_addr;
+  if constexpr (std::is_integral_v<SourceT>) {
+    src_addr = source;
+  }
+  else {
+    src_addr = cast_smem_ptr_to_uint(cute::raw_pointer_cast(source.data()));
+  }
+
+  uint32_t dst_addr;
+  if constexpr (std::is_integral_v<DstT>) {
+    dst_addr = dst;
+  }
+  else {
+    dst_addr = cast_smem_ptr_to_uint(cute::raw_pointer_cast(dst.data()));
+  }
+
+  uint32_t neighbor_dst_addr;
+  // 利用 PTX 指令，将共享内存地址映射到目标 CTA 的共享内存地址
+  asm volatile (
+    "mapa.shared::cluster.u32 %0, %1, %2;\n"
+    : "=r"(neighbor_dst_addr)
+    : "r"(dst_addr), "r"(dst_block_rank)
+  );
+
+  // 发射 cp.async.bulk 指令，完成从 src_addr 到 neighbor_dst_addr 的数据复制
+  asm volatile (
+    "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+    :
+    : "r"(neighbor_dst_addr), "r"(src_addr), "r"(size), "r"(bar_ptr)
+    : "memory"
+  );
+  asm volatile("cp.async.commit_group;" ::: "memory"); // 也许不需要这句？
+}
+
 
 template <int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
-    copyTMAKernel(CUTE_GRID_CONSTANT Params const params) {
+    copyTMAKernel_dsm(CUTE_GRID_CONSTANT Params const params) {
   using namespace cute;
 
   //
@@ -76,9 +130,18 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // Define smem tensor
   Tensor sS =
       make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
+  Tensor sS_dsm_local =
+      make_tensor(make_smem_ptr(shared_storage.smem_dsm_local.data()), smemLayout);
+  // 用于DSM接收
+  Tensor sS_dsm_remote =
+      make_tensor(make_smem_ptr(shared_storage.smem_dsm_remote.data()), smemLayout);
+
 
   // Get mbarrier object and its value type
   auto &mbarrier = shared_storage.mbarrier;
+
+  auto &mbarrier_dsm = shared_storage.mbarrier_dsm; // 现在 mbarrier_dsm 已经在此定义
+
   using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
   static_assert(cute::is_same_v<BarrierType, uint64_t>,
                 "Value type of mbarrier is uint64_t.");
@@ -107,11 +170,22 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
     mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
     copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)),
          cta_tmaS.partition_S(gS), cta_tmaS.partition_D(sS));
+
+    // 武装DSM屏障
+    mbarrier_dsm.init(1);
+    mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+
+    // 计算源CTA的ID（使用您的环形通信逻辑）
+    uint32_t src_block_rank = 
+        (cute::block_id_in_cluster().x + cute::cluster_shape().x - 1) % cute::cluster_shape().x;
+    copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
+
+    asm volatile("cp.async.commit_group;" ::: "memory");
   }
   __syncthreads();
 
   mbarrier.wait(0 /* phase */);
-  
+  mbarrier_dsm.wait(0);
   cutlass::arch::fence_view_async_shared();
 
   // Get CTA view of gmem out tensor
@@ -128,12 +202,11 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
 }
 
 template <int TILE_M = 128, int TILE_N = 128, int THREADS = 32>
-int copy_host_tma_load_and_store_kernel(int M, int N, int iterations = 1) {
+int copy_host_tma_load_and_store_kernel_dsm(int M, int N, int iterations = 1) {
   using namespace cute;
 
   printf("Copy with TMA load and store -- no swizzling.\n");
 
-  // using Element = float;
   using Element = cutlass::half_t;
 
   auto tensor_shape = make_shape(M, N);
@@ -181,10 +254,11 @@ int copy_host_tma_load_and_store_kernel(int M, int N, int iterations = 1) {
   printf("smem size: %d.\n", smem_size);
 
   void const *kernel =
-      (void const *)copyTMAKernel<THREADS, Element, decltype(params)>;
+      (void const *)copyTMAKernel_dsm<THREADS, Element, decltype(params)>;
   cfk::utils::set_smem_size(smem_size, kernel);
 
-  dim3 cluster_dims(1);
+  dim3 cluster_dims(2,1,1);
+  // dim3 cluster_dims(1);
 
   // Define the cluster launch parameter structure.
   cutlass::ClusterLaunchParams launch_params{gridDim, blockDim, cluster_dims,

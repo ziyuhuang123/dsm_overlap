@@ -1,4 +1,4 @@
-CUTLASS_DIR=../external/cutlass
+CUTLASS_DIR=/root/zyhuang/pure_cutlass/cutlass-main
 REPO_DIR=..
 CXX=nvcc
 APP=main

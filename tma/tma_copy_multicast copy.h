@@ -1,3 +1,6 @@
+// 这是没修改过的multicast为了备份的
+
+
 #pragma once
 
 #include <cassert>
@@ -26,7 +29,7 @@
 #include "cuda_launch.hpp"
 #include "shared_storage.h"
 #include "smem_helper.hpp"
-#include <cooperative_groups.h>
+
 template <typename _TiledCopyS, typename _TiledCopyD, typename _GmemLayout,
           typename _GmemLayoutOut, typename _SmemLayout, typename _TileShape,
           typename _ClusterShape>
@@ -60,130 +63,102 @@ struct ParamsMulticast {
 template <int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
     copyTMAKernelMulticast(CUTE_GRID_CONSTANT Params const params) {
-  // using namespace cute;
+  using namespace cute;
 
-  // //
-  // // Get layouts and tiled copies from Params struct
-  // //
-  // using GmemLayout = typename Params::GmemLayout;
-  // using GmemLayoutOut = typename Params::GmemLayoutOut;
-  // using SmemLayout = typename Params::SmemLayout;
-  // using TileShape = typename Params::TileShape;
-  // using ClusterShape = typename Params::ClusterShape;
+  //
+  // Get layouts and tiled copies from Params struct
+  //
+  using GmemLayout = typename Params::GmemLayout;
+  using GmemLayoutOut = typename Params::GmemLayoutOut;
+  using SmemLayout = typename Params::SmemLayout;
+  using TileShape = typename Params::TileShape;
+  using ClusterShape = typename Params::ClusterShape;
 
-  // auto &tmaLoad = params.tmaLoad;
-  // auto &tmaStore = params.tmaStore;
-  // auto &gmemLayout = params.gmemLayout;
-  // auto &gmemLayoutOut = params.gmemLayoutOut;
-  // auto &smemLayout = params.smemLayout;
-  // auto &tileShape = params.tileShape;
-  // auto &cluster_shape = params.cluster_shape;
+  auto &tmaLoad = params.tmaLoad;
+  auto &tmaStore = params.tmaStore;
+  auto &gmemLayout = params.gmemLayout;
+  auto &gmemLayoutOut = params.gmemLayoutOut;
+  auto &smemLayout = params.smemLayout;
+  auto &tileShape = params.tileShape;
+  auto &cluster_shape = params.cluster_shape;
 
-  // uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
 
-  // constexpr uint32_t cluster_size = size(ClusterShape{});
+  constexpr uint32_t cluster_size = size(ClusterShape{});
 
-  // uint16_t tma_mcast_mask = ((uint16_t(1) << cluster_size) - 1);
+  uint16_t tma_mcast_mask = ((uint16_t(1) << cluster_size) - 1);
 
-  // // Use Shared Storage structure to allocate aligned SMEM addresses.
-  // extern __shared__ char shared_memory[];
-  // using SharedStorage = SharedStorageTMA<Element, SmemLayout>;
-  // SharedStorage &shared_storage =
-  //     *reinterpret_cast<SharedStorage *>(shared_memory);
+  // Use Shared Storage structure to allocate aligned SMEM addresses.
+  extern __shared__ char shared_memory[];
+  using SharedStorage = SharedStorageTMA<Element, SmemLayout>;
+  SharedStorage &shared_storage =
+      *reinterpret_cast<SharedStorage *>(shared_memory);
 
-  // // Define smem tensor
-  // Tensor sS =
-  //     make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
-  // Tensor sS_dsm_local =
-  //     make_tensor(make_smem_ptr(shared_storage.smem_dsm_local.data()), smemLayout);
-  // // 用于DSM接收
-  // Tensor sS_dsm_remote =
-  //     make_tensor(make_smem_ptr(shared_storage.smem_dsm_remote.data()), smemLayout);
-  // auto &mbarrier_dsm = shared_storage.mbarrier_dsm; // 现在 mbarrier_dsm 已经在此定义
+  // Define smem tensor
+  Tensor sS =
+      make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
 
+  // Get mbarrier object and its value type
+  auto &mbarrier = shared_storage.mbarrier;
+  using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
+  static_assert(cute::is_same_v<BarrierType, uint64_t>,
+                "Value type of mbarrier is uint64_t.");
 
-  // // Get mbarrier object and its value type
-  // auto &mbarrier = shared_storage.mbarrier;
-  // using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-  // static_assert(cute::is_same_v<BarrierType, uint64_t>,
-  //               "Value type of mbarrier is uint64_t.");
+  // Constants used for TMA
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const bool lane_predicate = cute::elect_one_sync();
+  constexpr int kTmaTransactionBytes =
+      sizeof(ArrayEngine<Element, size(SmemLayout{})>);
 
-  // // Constants used for TMA
-  // const int warp_idx = cutlass::canonical_warp_idx_sync();
-  // const bool lane_predicate = cute::elect_one_sync();
-  // constexpr int kTmaTransactionBytes =
-  //     sizeof(ArrayEngine<Element, size(SmemLayout{})>);
+  // Prefetch TMA descriptors for load and store
+  if (warp_idx == 0 && lane_predicate) {
+    prefetch_tma_descriptor(tmaLoad.get_tma_descriptor());
+    prefetch_tma_descriptor(tmaStore.get_tma_descriptor());
+  }
 
-  // // Prefetch TMA descriptors for load and store
-  // if (warp_idx == 0 && lane_predicate) {
-  //   prefetch_tma_descriptor(tmaLoad.get_tma_descriptor());
-  //   prefetch_tma_descriptor(tmaStore.get_tma_descriptor());
-  // }
+  // Get CTA view of gmem tensor
+  Tensor mS = tmaLoad.get_tma_tensor(shape(gmemLayout));
+  auto blkCoord = make_coord(blockIdx.x, blockIdx.y);
+  Tensor gS = local_tile(mS, tileShape, blkCoord);
 
-  // // Get CTA view of gmem tensor
-  // Tensor mS = tmaLoad.get_tma_tensor(shape(gmemLayout));
-  // auto blkCoord = make_coord(blockIdx.x, blockIdx.y);
-  // Tensor gS = local_tile(mS, tileShape, blkCoord);
+  auto cta_tmaS = tmaLoad.get_slice(block_rank_in_cluster);
+  auto tSgSX = cta_tmaS.partition_S(gS);
+  auto tSgS = group_modes<1, rank(tSgSX)>(tSgSX);
+  auto tSsSX = cta_tmaS.partition_D(sS);
+  auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
 
-  // auto cta_tmaS = tmaLoad.get_slice(block_rank_in_cluster);
-  // auto tSgSX = cta_tmaS.partition_S(gS);
-  // auto tSgS = group_modes<1, rank(tSgSX)>(tSgSX);
-  // auto tSsSX = cta_tmaS.partition_D(sS);
-  // auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
+  if (warp_idx == 0 and lane_predicate) {
+    mbarrier.init(1 /* arrive count */);
+  }
+  __syncthreads();
+  cute::cluster_sync();
+  cutlass::arch::fence_barrier_init();
 
-  // if (warp_idx == 0 and lane_predicate) {
-  //   // for(int i=0; i<128*128;i++){
-  //   //   sS_dsm_local[i]=blockIdx.z+1;
-  //   // }
-  //   mbarrier.init(1 /* arrive count */);
-  //   mbarrier_dsm.init(1);
-  // }
-  // __syncthreads();
-  // cute::cluster_sync();
-  // cutlass::arch::fence_barrier_init();
+  if (warp_idx == 0 and lane_predicate) {
+    mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+    copy(
+        tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier), tma_mcast_mask),
+        tSgS(_, 0), tSsS(_, 0));
+  }
+  __syncthreads();
 
-  // if (warp_idx == 0 and lane_predicate) {
-  //   mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
-  //   copy(
-  //       tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier), tma_mcast_mask),
-  //       tSgS(_, 0), tSsS(_, 0));
+  mbarrier.wait(0 /* phase */);
 
+  cutlass::arch::fence_view_async_shared();
 
-        
-  //   mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+  // Get CTA view of gmem out tensor
+  auto blkCoordOut = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);
+  auto mD = tmaStore.get_tma_tensor(shape(gmemLayoutOut));
+  auto gD = local_tile(mD, tileShape, blkCoordOut);
 
-  //   // 计算源CTA的ID（使用您的环形通信逻辑）
-  //   uint32_t src_block_rank = 
-  //       (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
-  //   // copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
-  //   copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier_dsm), tma_mcast_mask), tSgS(_, 0), tSsS(_, 0));
+  auto cta_tmaD = tmaStore.get_slice(Int<0>{});
 
-  // }
-  // __syncthreads();
-
-  // mbarrier.wait(0 /* phase */);
-  // mbarrier_dsm.wait(0);
-  // cutlass::arch::fence_view_async_shared();
-
-
-  // if(blockIdx.x==0&&blockIdx.y==0&&blockIdx.z==0&&threadIdx.x==0){
-  //   print_tensor(sS_dsm_local);
-  //   print_tensor(sS_dsm_remote);
-  // }
-
-  // // Get CTA view of gmem out tensor
-  // auto blkCoordOut = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);
-  // auto mD = tmaStore.get_tma_tensor(shape(gmemLayoutOut));
-  // auto gD = local_tile(mD, tileShape, blkCoordOut);
-
-  // auto cta_tmaD = tmaStore.get_slice(Int<0>{});
-
-  // if (warp_idx == 0 and lane_predicate) {
-  //   cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
-  //   // cute::tma_store_arrive();
-  // }
-  // // cute::tma_store_wait<0>();
-  // cute::cluster_sync();
+  if (warp_idx == 0 and lane_predicate) {
+    cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
+    // cute::tma_store_arrive();
+  }
+  // cute::tma_store_wait<0>();
+  cute::cluster_sync();
 }
 
 template <int kNumThreads, class Element, class Params>
@@ -216,12 +191,6 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // Define smem tensor
   Tensor sS =
       make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
-  Tensor sS_dsm_local =
-      make_tensor(make_smem_ptr(shared_storage.smem_dsm_local.data()), smemLayout);
-  // 用于DSM接收
-  Tensor sS_dsm_remote =
-      make_tensor(make_smem_ptr(shared_storage.smem_dsm_remote.data()), smemLayout);
-  auto &mbarrier_dsm = shared_storage.mbarrier_dsm; // 现在 mbarrier_dsm 已经在此定义
 
   // Get mbarrier object and its value type
   auto &mbarrier = shared_storage.mbarrier;
@@ -252,11 +221,8 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   auto tSsSX = cta_tmaS.partition_D(sS);
   auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
 
-
-  
   if (warp_idx == 0 and lane_predicate) {
     mbarrier.init(1 /* arrive count */);
-    // mbarrier_dsm.init(1);
   }
   __syncthreads();
   cutlass::arch::fence_barrier_init();
@@ -265,43 +231,24 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
     mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
     copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
          tSsS(_, 0));
-
-    // mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
-
-    // // 计算源CTA的ID（使用您的环形通信逻辑）
-    // uint32_t src_block_rank = 
-    //     (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
-    // copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
-    // copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier_dsm)), tSgS(_, 0), tSsS(_, 0));
   }
-
-  // uint32_t src_block_rank = (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
-  // namespace cg = cooperative_groups;
-  // cg::cluster_group cluster = cg::this_cluster();
-  // auto *dst_smem = cluster.map_shared_rank(shared_storage.smem_dsm_remote.data(), src_block_rank);
-  // Tensor sS_dsm_remote_dsm = make_tensor(make_smem_ptr(dst_smem), smemLayout);
-
-  // cooperative_copy<kNumThreads, 128>(threadIdx.x, sS_dsm_local, sS_dsm_remote, AutoCopyAsync{});
-  cooperative_copy<kNumThreads, 128>(threadIdx.x, sS_dsm_local, sS_dsm_remote, AutoVectorizingCopy{});
-
   __syncthreads();
 
   mbarrier.wait(0 /* phase */);
-  // mbarrier_dsm.wait(0 /* phase */);
+
   cutlass::arch::fence_view_async_shared();
 
+  // Get CTA view of gmem out tensor
+  auto blkCoordOut = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);
+  auto mD = tmaStore.get_tma_tensor(shape(gmemLayoutOut));
+  auto gD = local_tile(mD, tileShape, blkCoordOut);
 
-  // // Get CTA view of gmem out tensor
-  // auto blkCoordOut = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);
-  // auto mD = tmaStore.get_tma_tensor(shape(gmemLayoutOut));
-  // auto gD = local_tile(mD, tileShape, blkCoordOut);
+  auto cta_tmaD = tmaStore.get_slice(Int<0>{});
 
-  // auto cta_tmaD = tmaStore.get_slice(Int<0>{});
-
-  // if (warp_idx == 0 and lane_predicate) {
-  //   cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
-  //   // cute::tma_store_arrive();
-  // }
+  if (warp_idx == 0 and lane_predicate) {
+    cute::copy(tmaStore, cta_tmaD.partition_S(sS), cta_tmaD.partition_D(gD));
+    // cute::tma_store_arrive();
+  }
   // cute::tma_store_wait<0>();
 }
 
@@ -309,9 +256,7 @@ template <bool use_multicast = true, int COPYN = 2, int TILE_M = 128,
           int TILE_N = 128, int THREADS = 128>
 int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
                                                   int iterations = 1) {
-                                                  
   using namespace cute;
-
 
   std::cout << "Deep copy " << COPYN << "X." << std::endl;
 
@@ -397,76 +342,27 @@ int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
   cutlass::ClusterLaunchParams launch_params{gridDim, blockDim, cluster_dims,
                                              smem_size};
 
-  // for (int i = 0; i < iterations; i++) {
-  //   auto t1 = std::chrono::high_resolution_clock::now();
-  //   if constexpr (use_multicast)
-  //     cutlass::Status status =
-  //         cutlass::launch_kernel_on_cluster(launch_params, kernel, params);
-  //   else
-  //     cutlass::Status status = cutlass::launch_kernel_on_cluster(
-  //         launch_params, kernel, params_no_multicast);
-  //   cudaError result = cudaDeviceSynchronize();
-  //   auto t2 = std::chrono::high_resolution_clock::now();
-  //   if (result != cudaSuccess) {
-  //     std::cerr << "CUDA Runtime error: " << cudaGetErrorString(result)
-  //               << std::endl;
-  //     return -1;
-  //   }
-  //   std::chrono::duration<double, std::milli> tDiff = t2 - t1;
-  //   double time_ms = tDiff.count();
-  //   std::cout << "Trial " << i << " Completed in " << time_ms << "ms ("
-  //             << (COPYN + 1) * 1e-6 * M * N * sizeof(Element) / time_ms
-  //             << " GB/s)" << std::endl;
-  // }
-
-
-  // 1. 在循环外定义一个变量，用于累加总耗时
-  double total_time_ms = 0.0;
-
   for (int i = 0; i < iterations; i++) {
     auto t1 = std::chrono::high_resolution_clock::now();
-    
-    // 2. 启动Kernel的逻辑保持不变，包括 if constexpr
-    if constexpr (use_multicast) {
+    if constexpr (use_multicast)
       cutlass::Status status =
           cutlass::launch_kernel_on_cluster(launch_params, kernel, params);
-    }
-    else {
+    else
       cutlass::Status status = cutlass::launch_kernel_on_cluster(
           launch_params, kernel, params_no_multicast);
-    }
-    
-    // 等待Kernel执行完毕
     cudaError result = cudaDeviceSynchronize();
-    
     auto t2 = std::chrono::high_resolution_clock::now();
-
-    // 检查CUDA错误
     if (result != cudaSuccess) {
       std::cerr << "CUDA Runtime error: " << cudaGetErrorString(result)
                 << std::endl;
       return -1;
     }
-    
-    // 3. 计算单次运行时间并累加，而不是直接打印
     std::chrono::duration<double, std::milli> tDiff = t2 - t1;
-    total_time_ms += tDiff.count();
+    double time_ms = tDiff.count();
+    std::cout << "Trial " << i << " Completed in " << time_ms << "ms ("
+              << (COPYN + 1) * 1e-6 * M * N * sizeof(Element) / time_ms
+              << " GB/s)" << std::endl;
   }
-
-  // 4. 循环结束后，计算平均值并统一打印结果
-  if (iterations > 0) {
-    // 计算平均耗时
-    double average_time_ms = total_time_ms / iterations;
-    
-    // 基于平均耗时计算平均性能（吞吐率）
-    double gb_per_s = (COPYN + 1) * 1e-6 * M * N * sizeof(Element) / average_time_ms;
-
-    // 打印最终的平均结果
-    std::cout << "Completed " << iterations << " trials." << std::endl;
-    std::cout << "Average time: " << average_time_ms << " ms" << std::endl;
-    std::cout << "Average throughput: " << gb_per_s << " GB/s" << std::endl;
-  }
-
 
   //
   // Verify
