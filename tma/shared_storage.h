@@ -10,22 +10,35 @@
 //   cutlass::arch::ClusterTransactionBarrier mbarrier;
 // };
 
-template <class Element, class SmemLayout>
+// template <class Element, class SmemLayout>
+// struct SharedStorageTMA {
+//   // 1. TMA 使用的缓冲区和屏障
+//   cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
+//                       cutlass::detail::alignment_for_swizzle(SmemLayout{})>
+//       smem; // sS 将指向这里
+//   cutlass::arch::ClusterTransactionBarrier mbarrier;
+
+//   // 2. DSM 使用的本地发送缓冲区
+//   cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
+//                       cutlass::detail::alignment_for_swizzle(SmemLayout{})>
+//       smem_dsm_local; // sS_dsm_local 将指向这里
+
+//   // 3. DSM 使用的本地接收缓冲区和屏障
+//   cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
+//                       cutlass::detail::alignment_for_swizzle(SmemLayout{})>
+//       smem_dsm_remote; // sS_dsm_remote 将指向这里
+//   cutlass::arch::ClusterTransactionBarrier mbarrier_dsm;
+// };
+
+template <int N_STAGES, class Element, class SmemLayout>
 struct SharedStorageTMA {
-  // 1. TMA 使用的缓冲区和屏障
-  cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
-                      cutlass::detail::alignment_for_swizzle(SmemLayout{})>
-      smem; // sS 将指向这里
-  cutlass::arch::ClusterTransactionBarrier mbarrier;
+  // 定义每个“阶段”包含的资源：一个屏障和一个缓冲区
+  struct Stage {
+    cutlass::arch::ClusterTransactionBarrier barrier;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
+                        cutlass::detail::alignment_for_swizzle(SmemLayout{})> smem;
+  };
 
-  // 2. DSM 使用的本地发送缓冲区
-  cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
-                      cutlass::detail::alignment_for_swizzle(SmemLayout{})>
-      smem_dsm_local; // sS_dsm_local 将指向这里
-
-  // 3. DSM 使用的本地接收缓冲区和屏障
-  cute::array_aligned<Element, cute::cosize_v<SmemLayout>,
-                      cutlass::detail::alignment_for_swizzle(SmemLayout{})>
-      smem_dsm_remote; // sS_dsm_remote 将指向这里
-  cutlass::arch::ClusterTransactionBarrier mbarrier_dsm;
+  // 创建一个包含 N_STAGES 个“阶段”的数组
+  cute::array<Stage, N_STAGES> stages;
 };
