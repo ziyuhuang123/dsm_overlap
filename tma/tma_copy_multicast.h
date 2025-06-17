@@ -186,49 +186,7 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // cute::cluster_sync();
 }
 
-
-    // copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0), tSsS(_, 0));
-
-template<class Barrier, class CopyT, class TS, class TD>
-CUTLASS_DEVICE
-void g2s(Barrier* br, CopyT& tmaLoad,
-         TS const& src_gmem, TD& dst_smem,        // ← 目标去掉 const
-         int bytes) {
-
-  using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-
-  if (threadIdx.x == 0) {
-    br->arrive_and_expect_tx(bytes);
-    copy(tmaLoad.with(reinterpret_cast<BarrierType&>(*br)),  // 单参数 OK
-         src_gmem,
-         dst_smem);
-  }
-}
-
-template<class Barrier, class TS, class TD>
-CUTLASS_DEVICE
-void dsm2s(Barrier* br,
-           TS& dst_smem_local, TD& dst_smem_remote,
-           int bytes, uint32_t src_rank) {
-  if(threadIdx.x==0){
-    br->arrive_and_expect_tx(bytes);
-    copy_dsm(*br, dst_smem_local, dst_smem_remote, bytes, src_rank);
-  }
-}
-template<int kNumThreads, class TDstSmem, class TSrcSmem>
-CUTLASS_DEVICE
-void dsm2s_reg(TDstSmem& dst_smem_local, TSrcSmem& src_smem_remote) {
-  using namespace cute;
-  cooperative_copy<kNumThreads, 128>(
-      threadIdx.x,
-      dst_smem_local,      // 目标 SMEM
-      src_smem_remote,     // 源   SMEM（DSM Remote）
-      AutoCopyAsync{});
-}
-
-
-
-template<int copy_mode, int kNumThreads, class Element, class Params>
+template <int kConcurrentCopies, int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
     copyTMAKernelNoMulticast(CUTE_GRID_CONSTANT Params const params) {
   using namespace cute;
@@ -251,22 +209,30 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
 
   // Use Shared Storage structure to allocate aligned SMEM addresses.
   extern __shared__ char shared_memory[];
-  using SharedStorage = SharedStorageTMA<Element, SmemLayout>;
+  // using SharedStorage = SharedStorageTMA<Element, SmemLayout>;
+
+  // constexpr int CONCURRENT_COPIES = 7;
+
+  // --- 2. 定义和获取流水线式共享内存 ---
+  using SharedStorage = SharedStorageTMA<kConcurrentCopies, Element, SmemLayout>;
+
   SharedStorage &shared_storage =
       *reinterpret_cast<SharedStorage *>(shared_memory);
 
-  // Define smem tensor
-  Tensor sS =
-      make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
-  Tensor sS_dsm_local =
-      make_tensor(make_smem_ptr(shared_storage.smem_dsm_local.data()), smemLayout);
-  // 用于DSM接收
-  Tensor sS_dsm_remote =
-      make_tensor(make_smem_ptr(shared_storage.smem_dsm_remote.data()), smemLayout);
-  auto &mbarrier_dsm = shared_storage.mbarrier_dsm; // 现在 mbarrier_dsm 已经在此定义
+  // // Define smem tensor
+  // Tensor sS =
+  //     make_tensor(make_smem_ptr(shared_storage.smem.data()), smemLayout);
+  // Tensor sS_dsm_local =
+  //     make_tensor(make_smem_ptr(shared_storage.smem_dsm_local.data()), smemLayout);
+  // // 用于DSM接收
+  // Tensor sS_dsm_remote =
+  //     make_tensor(make_smem_ptr(shared_storage.smem_dsm_remote.data()), smemLayout);
+  // auto &mbarrier_dsm = shared_storage.mbarrier_dsm; // 现在 mbarrier_dsm 已经在此定义
 
-  // Get mbarrier object and its value type
-  auto &mbarrier = shared_storage.mbarrier;
+  // // Get mbarrier object and its value type
+  // auto &mbarrier = shared_storage.mbarrier;
+
+
   using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
   static_assert(cute::is_same_v<BarrierType, uint64_t>,
                 "Value type of mbarrier is uint64_t.");
@@ -291,18 +257,50 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   auto cta_tmaS = tmaLoad.get_slice(0);
   auto tSgSX = cta_tmaS.partition_S(gS);
   auto tSgS = group_modes<1, rank(tSgSX)>(tSgSX);
-  auto tSsSX = cta_tmaS.partition_D(sS);
-  auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
+  // auto tSsSX = cta_tmaS.partition_D(sS);
+  // auto tSsS = group_modes<1, rank(tSsSX)>(tSsSX);
 
 
   
   if (warp_idx == 0 and lane_predicate) {
-    mbarrier.init(1 /* arrive count */);
-    mbarrier_dsm.init(1);
+    #pragma unroll
+    for (int i = 0; i < kConcurrentCopies; ++i) {
+      shared_storage.stages[i].barrier.init(1);
+    }
   }
   __syncthreads();
   cutlass::arch::fence_barrier_init();
 
+  if (warp_idx == 0 and lane_predicate) {
+
+
+
+    // 用一个循环，一次性发出 kConcurrentCopies 个独立的TMA加载指令
+    #pragma unroll
+    for (int i = 0; i < kConcurrentCopies; ++i) {
+      // 获取当前阶段的屏障和SMEM缓冲区的引用/指针
+      auto& stage_barrier = shared_storage.stages[i].barrier;
+      Tensor stage_smem = make_tensor(make_smem_ptr(shared_storage.stages[i].smem.data()), smemLayout);
+      
+      // 核心修改：为每个拷贝任务计算不同的源数据瓦片
+      // 我们从gS中，沿着M维度（行）切出第i个小瓦片
+      auto coord_offset_i = make_coord(i * size<0>(TileShape{}), 0);
+      Tensor gS_tile_i = local_tile(gS, tileShape, coord_offset_i);
+
+      // 为第 i 个拷贝任务武装第 i 个屏障
+      stage_barrier.arrive_and_expect_tx(kTmaTransactionBytes);
+
+      // 发出第 i 个拷贝指令，关联第 i 个屏障
+      copy(tmaLoad.with(reinterpret_cast<BarrierType&>(stage_barrier)), 
+           tmaLoad.get_slice(0).partition_S(gS_tile_i),
+           tmaLoad.get_slice(0).partition_D(stage_smem));
+    }
+    // 所有指令都发出后，用一个commit统一提交
+    asm volatile("cp.async.commit_group;" ::: "memory");
+
+    // mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+    // copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+    //      tSsS(_, 0));
 
 
 bool need_wait_g   = false;
@@ -414,7 +412,10 @@ if (need_wait_dsm) mbarrier_dsm.wait(0);
 
   // __syncthreads();
 
-  // mbarrier.wait(0 /* phase */);
+  #pragma unroll
+  for (int i = 0; i < kConcurrentCopies; ++i) {
+    shared_storage.stages[i].barrier.wait(0);
+  }
   // mbarrier_dsm.wait(0 /* phase */);
   cutlass::arch::fence_view_async_shared();
 
@@ -433,7 +434,7 @@ if (need_wait_dsm) mbarrier_dsm.wait(0);
   // cute::tma_store_wait<0>();
 }
 
-template<bool use_multicast = true, int COPYN = 2, int TILE_M = 128,
+template <int CONCURRENT_COPIES = 7, bool use_multicast = true, int COPYN = 2, int TILE_M = 128,
           int TILE_N = 128, int THREADS = 128>
 int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
                                                   int iterations, int copy_mode) {
@@ -508,7 +509,7 @@ int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
   dim3 cluster_dims(size<0>(cluster_shape), size<1>(cluster_shape),
                     size<2>(cluster_shape));
 
-  int smem_size = int(sizeof(SharedStorageTMA<Element, decltype(smemLayout)>));
+  int smem_size = int(sizeof(SharedStorageTMA<CONCURRENT_COPIES, Element, decltype(smemLayout)>));
   printf("smem size: %d.\n", smem_size);
 
   void const *kernel;
@@ -516,27 +517,9 @@ int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
     kernel = (void const *)
         copyTMAKernelMulticast<THREADS, Element, decltype(params)>;
   else
-    // kernel =
-    //     (void const *)copyTMAKernelNoMulticast<copy_mode, THREADS, Element, decltype(params_no_multicast)>;
-
-
-    void const* kernel = nullptr;
-    switch (copy_mode) {
-      case 0: kernel = (void*)
-          copyTMAKernelNoMulticast<0, THREADS, Element, decltype(params_no_multicast)>; break;
-      case 1: kernel = (void*)
-          copyTMAKernelNoMulticast<1, THREADS, Element, decltype(params_no_multicast)>; break;
-      case 2: kernel = (void*)
-          copyTMAKernelNoMulticast<2, THREADS, Element, decltype(params_no_multicast)>; break;
-      case 3: kernel = (void*)
-          copyTMAKernelNoMulticast<3, THREADS, Element, decltype(params_no_multicast)>; break;
-      case 4: kernel = (void*)
-          copyTMAKernelNoMulticast<4, THREADS, Element, decltype(params_no_multicast)>; break;
-      default:
-        std::cerr << "copy_mode must be 0–4\n";  return -1;
-    }
-
-
+    kernel =
+        (void const *)copyTMAKernelNoMulticast<CONCURRENT_COPIES, THREADS, Element,
+                                               decltype(params_no_multicast)>;
   cfk::utils::set_smem_size(smem_size, kernel);
 
   // Define the cluster launch parameter structure.

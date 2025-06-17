@@ -40,7 +40,7 @@ std::cout << "Matrix (" << M << ", " << N << "),  mode " << copy_mode
   // scaleTmaKernelHost(M, N, iterations);
   // copy_host_tma_load_and_store_kernel_multicast<true, 2>(M, N, iterations);
   // copy_host_tma_load_and_store_kernel_multicast<false, 2>(M, N, iterations);
-  copy_host_tma_load_and_store_kernel_multicast<false, 2, 128, 128>(M, N, iterations, copy_mode);         // ← 新增第 4 个实参
+  copy_host_tma_load_and_store_kernel_multicast<6, false, 2, 64, 256>(M, N, iterations);
   // copy_host_tma_load_and_store_kernel_multicast<true, 4>(M, N, iterations);
   // copy_host_tma_load_and_store_kernel_multicast<false, 4>(M, N, iterations);
 
