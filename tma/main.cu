@@ -16,16 +16,16 @@ int main(int argc, char const **argv) {
   cmd.get_cmd_line_argument("M",   M);
   cmd.get_cmd_line_argument("N",   N);
   cmd.get_cmd_line_argument("iterations", iterations);
-  cmd.get_cmd_line_argument("mode", copy_mode);
+  cmd.get_cmd_line_argument("copy_mode", copy_mode);
 
-  std::cout << "(M,N)=(" << M << "," << N << "), mode=" << copy_mode << '\n';
+  std::cout << "(M,N)=(" << M << "," << N << "), copy_mode=" << copy_mode << '\n';
 
 auto mode_str = [&]() -> const char* {
   switch (copy_mode) {
     case 0:  return "only globl";
     case 1:  return "G + G";
     case 2:  return "G + DSM";
-    case 3:  return "G + DSM(TMA)";
+    case 3:  return "G + DSM(reg)";
     case 4:  return "only DSM";
     default: return "INVALID";
   }

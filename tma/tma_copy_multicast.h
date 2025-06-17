@@ -339,7 +339,7 @@ bool need_wait_dsm = false;
       break;
     }
 
-    case 2: {                           // global + DSM → smem
+    case 2: {                           // global + DSM
       if (warp_idx == 0 and lane_predicate) {
         mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
         copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
