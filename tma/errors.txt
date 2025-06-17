@@ -1,3 +1,9 @@
 rm -f main.o  main
 nvcc -c --generate-code=arch=compute_90a,code=[compute_90a] -std=c++17 -O3 -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing -I/root/zyhuang/pure_cutlass/cutlass-main/include -I/root/zyhuang/pure_cutlass/cutlass-main/examples/common -I/root/zyhuang/pure_cutlass/cutlass-main/tools/util/include -I../include/utils --expt-relaxed-constexpr -o "main.o" main.cu
+tma_copy_multicast.h(523): warning #177-D: variable "kernel" was declared but never referenced
+      void const* kernel = nullptr;
+                  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
 nvcc --generate-code=arch=compute_90a,code=[compute_90a] -std=c++17 -O3 -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing -I/root/zyhuang/pure_cutlass/cutlass-main/include -I/root/zyhuang/pure_cutlass/cutlass-main/examples/common -I/root/zyhuang/pure_cutlass/cutlass-main/tools/util/include -I../include/utils --expt-relaxed-constexpr  -o main main.o  -lcuda

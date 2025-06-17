@@ -186,7 +186,49 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // cute::cluster_sync();
 }
 
-template <int kNumThreads, class Element, class Params>
+
+    // copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0), tSsS(_, 0));
+
+template<class Barrier, class CopyT, class TS, class TD>
+CUTLASS_DEVICE
+void g2s(Barrier* br, CopyT& tmaLoad,
+         TS const& src_gmem, TD& dst_smem,        // ← 目标去掉 const
+         int bytes) {
+
+  using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
+
+  if (threadIdx.x == 0) {
+    br->arrive_and_expect_tx(bytes);
+    copy(tmaLoad.with(reinterpret_cast<BarrierType&>(*br)),  // 单参数 OK
+         src_gmem,
+         dst_smem);
+  }
+}
+
+template<class Barrier, class TS, class TD>
+CUTLASS_DEVICE
+void dsm2s(Barrier* br,
+           TS& dst_smem_local, TD& dst_smem_remote,
+           int bytes, uint32_t src_rank) {
+  if(threadIdx.x==0){
+    br->arrive_and_expect_tx(bytes);
+    copy_dsm(*br, dst_smem_local, dst_smem_remote, bytes, src_rank);
+  }
+}
+template<int kNumThreads, class TDstSmem, class TSrcSmem>
+CUTLASS_DEVICE
+void dsm2s_reg(TDstSmem& dst_smem_local, TSrcSmem& src_smem_remote) {
+  using namespace cute;
+  cooperative_copy<kNumThreads, 128>(
+      threadIdx.x,
+      dst_smem_local,      // 目标 SMEM
+      src_smem_remote,     // 源   SMEM（DSM Remote）
+      AutoCopyAsync{});
+}
+
+
+
+template<int copy_mode, int kNumThreads, class Element, class Params>
 __global__ static void __launch_bounds__(kNumThreads, 1)
     copyTMAKernelNoMulticast(CUTE_GRID_CONSTANT Params const params) {
   using namespace cute;
@@ -256,24 +298,110 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   
   if (warp_idx == 0 and lane_predicate) {
     mbarrier.init(1 /* arrive count */);
-    // mbarrier_dsm.init(1);
+    mbarrier_dsm.init(1);
   }
   __syncthreads();
   cutlass::arch::fence_barrier_init();
 
-  if (warp_idx == 0 and lane_predicate) {
-    mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
-    copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
-         tSsS(_, 0));
 
-    // mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
 
-    // // 计算源CTA的ID（使用您的环形通信逻辑）
-    // uint32_t src_block_rank = 
-    //     (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
-    // copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
-    // copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier_dsm)), tSgS(_, 0), tSsS(_, 0));
-  }
+bool need_wait_g   = false;
+bool need_wait_dsm = false;
+
+
+  uint32_t src_rank =
+      (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) %
+       cute::cluster_shape().z;
+
+  switch (copy_mode) {
+
+    case 0: {                           // 仅 global
+      if (warp_idx == 0 and lane_predicate) {
+        mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+        copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+            tSsS(_, 0));
+      }
+      need_wait_g = true;
+      break;
+    }
+
+    case 1: {                           // global + global
+      if (warp_idx == 0 and lane_predicate) {
+        mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+        copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+            tSsS(_, 0));
+
+
+        mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+        copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier_dsm)), tSgS(_, 0), tSsS(_, 0));
+      }
+      need_wait_g = true;
+      break;
+    }
+
+    case 2: {                           // global + DSM → smem
+      if (warp_idx == 0 and lane_predicate) {
+        mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+        copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+            tSsS(_, 0));
+
+
+        mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+        // // 计算源CTA的ID（使用您的环形通信逻辑）
+        uint32_t src_block_rank = 
+            (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
+        copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
+      }
+
+      need_wait_g = need_wait_dsm = true;
+      break;
+    }
+
+    case 3: {                           // global + DSM → reg
+      if (warp_idx == 0 and lane_predicate) {
+        mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+        copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+            tSsS(_, 0));
+      }
+      // 把 DSM 片段直接拉进寄存器
+      dsm2s_reg<kNumThreads>(sS_dsm_local, sS_dsm_remote);
+      need_wait_g = true;              // DSM-REG 路径不依赖 mbarrier
+      break;
+    }
+
+    case 4: {                           // 仅dsm
+      if (warp_idx == 0 and lane_predicate) {
+        mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+        // // 计算源CTA的ID（使用您的环形通信逻辑）
+        uint32_t src_block_rank = 
+            (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
+        copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
+      }
+      need_wait_dsm = true;
+      break;
+    }
+
+} // CTA-leader 结束
+
+__syncthreads();
+
+if (need_wait_g)   mbarrier.wait(0);
+if (need_wait_dsm) mbarrier_dsm.wait(0);
+
+
+  // if (warp_idx == 0 and lane_predicate) {
+  //   mbarrier.arrive_and_expect_tx(kTmaTransactionBytes);
+  //   copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier)), tSgS(_, 0),
+  //        tSsS(_, 0));
+
+  //   mbarrier_dsm.arrive_and_expect_tx(kTmaTransactionBytes);
+
+  //   // // 计算源CTA的ID（使用您的环形通信逻辑）
+  //   uint32_t src_block_rank = 
+  //       (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
+  //   copy_dsm(mbarrier_dsm, sS_dsm_local, sS_dsm_remote, kTmaTransactionBytes, src_block_rank);
+  //   copy(tmaLoad.with(reinterpret_cast<BarrierType &>(mbarrier_dsm)), tSgS(_, 0), tSsS(_, 0));
+  // }
 
   // uint32_t src_block_rank = (cute::block_id_in_cluster().z + cute::cluster_shape().z - 1) % cute::cluster_shape().z;
   // namespace cg = cooperative_groups;
@@ -282,11 +410,11 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // Tensor sS_dsm_remote_dsm = make_tensor(make_smem_ptr(dst_smem), smemLayout);
 
   // cooperative_copy<kNumThreads, 128>(threadIdx.x, sS_dsm_local, sS_dsm_remote, AutoCopyAsync{});
-  cooperative_copy<kNumThreads, 128>(threadIdx.x, sS_dsm_local, sS_dsm_remote, AutoVectorizingCopy{});
+  // cooperative_copy<kNumThreads, 128>(threadIdx.x, sS_dsm_local, sS_dsm_remote, AutoVectorizingCopy{});
 
-  __syncthreads();
+  // __syncthreads();
 
-  mbarrier.wait(0 /* phase */);
+  // mbarrier.wait(0 /* phase */);
   // mbarrier_dsm.wait(0 /* phase */);
   cutlass::arch::fence_view_async_shared();
 
@@ -305,10 +433,10 @@ __global__ static void __launch_bounds__(kNumThreads, 1)
   // cute::tma_store_wait<0>();
 }
 
-template <bool use_multicast = true, int COPYN = 2, int TILE_M = 128,
+template<bool use_multicast = true, int COPYN = 2, int TILE_M = 128,
           int TILE_N = 128, int THREADS = 128>
 int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
-                                                  int iterations = 1) {
+                                                  int iterations, int copy_mode) {
                                                   
   using namespace cute;
 
@@ -388,9 +516,27 @@ int copy_host_tma_load_and_store_kernel_multicast(int M, int N,
     kernel = (void const *)
         copyTMAKernelMulticast<THREADS, Element, decltype(params)>;
   else
-    kernel =
-        (void const *)copyTMAKernelNoMulticast<THREADS, Element,
-                                               decltype(params_no_multicast)>;
+    // kernel =
+    //     (void const *)copyTMAKernelNoMulticast<copy_mode, THREADS, Element, decltype(params_no_multicast)>;
+
+
+    void const* kernel = nullptr;
+    switch (copy_mode) {
+      case 0: kernel = (void*)
+          copyTMAKernelNoMulticast<0, THREADS, Element, decltype(params_no_multicast)>; break;
+      case 1: kernel = (void*)
+          copyTMAKernelNoMulticast<1, THREADS, Element, decltype(params_no_multicast)>; break;
+      case 2: kernel = (void*)
+          copyTMAKernelNoMulticast<2, THREADS, Element, decltype(params_no_multicast)>; break;
+      case 3: kernel = (void*)
+          copyTMAKernelNoMulticast<3, THREADS, Element, decltype(params_no_multicast)>; break;
+      case 4: kernel = (void*)
+          copyTMAKernelNoMulticast<4, THREADS, Element, decltype(params_no_multicast)>; break;
+      default:
+        std::cerr << "copy_mode must be 0–4\n";  return -1;
+    }
+
+
   cfk::utils::set_smem_size(smem_size, kernel);
 
   // Define the cluster launch parameter structure.
