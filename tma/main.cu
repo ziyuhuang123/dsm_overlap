@@ -20,19 +20,19 @@ int main(int argc, char const **argv) {
 
   std::cout << "(M,N)=(" << M << "," << N << "), copy_mode=" << copy_mode << '\n';
 
-auto mode_str = [&]() -> const char* {
-  switch (copy_mode) {
-    case 0:  return "only globl";
-    case 1:  return "G + G";
-    case 2:  return "G + DSM";
-    case 3:  return "G + DSM(reg)";
-    case 4:  return "only DSM";
-    default: return "INVALID";
-  }
-}();
+  auto mode_str = [&]() -> const char* {
+    switch (copy_mode) {
+      case 0:  return "only globl";
+      case 1:  return "G + G";
+      case 2:  return "G + DSM";
+      case 3:  return "G + DSM(reg)";
+      case 4:  return "only DSM";
+      default: return "INVALID";
+    }
+  }();
 
-std::cout << "Matrix (" << M << ", " << N << "),  mode " << copy_mode
-          << "  [" << mode_str << "],  iterations = " << iterations << '\n';
+  std::cout << "Matrix (" << M << ", " << N << "),  mode " << copy_mode
+            << "  [" << mode_str << "],  iterations = " << iterations << '\n';
 
 
   // copy_host_tma_load_and_store_kernel<128, 256>(M, N, iterations);
